@@ -1,0 +1,28 @@
+---
+- name: Classify platform
+  ansible.builtin.set_fact:
+    cve_kernel_distro_id: "{{ ansible_distribution | lower }}"
+    cve_kernel_distro_major: "{{ ansible_distribution_major_version | string }}"
+    cve_kernel_running_kernel: "{{ ansible_kernel }}"
+    cve_kernel_is_rhel_family: "{{ (ansible_distribution | lower) in cve_kernel_rhel_family_distros }}"
+    cve_kernel_is_deb_family: "{{ (ansible_distribution | lower) in cve_kernel_deb_family_distros }}"
+
+- name: Assert supported platform
+  ansible.builtin.assert:
+    that:
+      - cve_kernel_is_rhel_family | bool or cve_kernel_is_deb_family | bool
+    fail_msg: "Unsupported platform: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+- name: Resolve fixed kernel thresholds
+  ansible.builtin.set_fact:
+    cve_kernel_dirtyfrag_fixed_ver: "{{ cve_kernel_dirtyfrag_fixed_versions.get(cve_kernel_distro_major, 'unknown') }}"
+    cve_kernel_fragnesia_fixed_ver: "{{ cve_kernel_fragnesia_fixed_versions.get(cve_kernel_distro_major, 'unknown') }}"
+    cve_kernel_sshkeysign_fixed_ver: "{{ cve_kernel_sshkeysign_fixed_versions.get(cve_kernel_distro_major, 'unknown') }}"
+
+- name: Gather package facts
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Detect nginx package presence
+  ansible.builtin.set_fact:
+    cve_kernel_nginx_present: "{{ 'nginx' in ansible_facts.packages }}"

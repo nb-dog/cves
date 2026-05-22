@@ -1,0 +1,44 @@
+---
+- name: Refresh package facts for kernel detection
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Determine newest installed kernel on RHEL family
+  ansible.builtin.shell: |
+    set -o pipefail
+    (
+      rpm -q kernel-core --queryformat '%{EVR}.%{ARCH}\n' 2>/dev/null || true
+      rpm -q kernel --queryformat '%{EVR}.%{ARCH}\n' 2>/dev/null || true
+    ) | grep -E '^[0-9]' | sed 's/^[0-9]*://' | sort -V | tail -1
+  args:
+    executable: /bin/bash
+  register: cve_kernel_rhel_newest_installed_raw
+  changed_when: false
+  when: cve_kernel_is_rhel_family | bool
+
+- name: Determine newest installed kernel on Debian family
+  ansible.builtin.shell: |
+    set -o pipefail
+    dpkg --list 'linux-image-[0-9]*' 'pve-kernel-[0-9]*' 'proxmox-kernel-[0-9]*' 2>/dev/null \
+      | awk '/^ii/{print $2}' \
+      | sed 's/linux-image-//; s/pve-kernel-//; s/proxmox-kernel-//' \
+      | sort -V | tail -1
+  args:
+    executable: /bin/bash
+  register: cve_kernel_deb_newest_installed_raw
+  changed_when: false
+  when: cve_kernel_is_deb_family | bool
+
+- name: Set newest installed kernel from family-specific detection
+  ansible.builtin.set_fact:
+    cve_kernel_newest_installed_kernel_raw: >-
+      {{ cve_kernel_rhel_newest_installed_raw.stdout if cve_kernel_is_rhel_family | bool else cve_kernel_deb_newest_installed_raw.stdout }}
+
+- name: Normalize newest installed kernel value
+  ansible.builtin.set_fact:
+    cve_kernel_newest_installed_kernel: "{{ cve_kernel_newest_installed_kernel_raw | default(cve_kernel_running_kernel, true) | trim }}"
+
+- name: Normalize running and installed kernel values
+  ansible.builtin.set_fact:
+    cve_kernel_running_kernel_norm: "{{ cve_kernel_running_kernel | regex_replace('\\.(x86_64|aarch64|i686|amd64|arm64)$', '') }}"
+    cve_kernel_newest_installed_kernel_norm: "{{ cve_kernel_newest_installed_kernel | regex_replace('\\.(x86_64|aarch64|i686|amd64|arm64)$', '') }}"

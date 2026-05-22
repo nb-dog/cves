@@ -1,0 +1,108 @@
+---
+- name: Include common initialization
+  ansible.builtin.include_tasks: common/init.yml
+
+- name: Include pre-action mitigation signals
+  ansible.builtin.include_tasks: common/signals_pre.yml
+
+- name: Include pre-action status computation
+  ansible.builtin.include_tasks: common/status_pre.yml
+
+- name: Update RHEL kernel packages
+  ansible.builtin.dnf:
+    name:
+      - kernel
+      - kernel-core
+      - kernel-modules
+    state: latest
+    update_cache: true
+  when: cve_kernel_is_rhel_family | bool
+
+- name: Set Debian kernel meta package
+  ansible.builtin.set_fact:
+    cve_kernel_deb_kernel_meta: "{{ cve_kernel_debian_kernel_meta.get(ansible_architecture, 'linux-image-amd64') }}"
+  when: cve_kernel_is_deb_family | bool
+
+- name: Update Debian kernel meta package
+  ansible.builtin.apt:
+    name: "{{ 'linux-image-generic' if cve_kernel_distro_id == 'ubuntu' else cve_kernel_deb_kernel_meta }}"
+    state: latest
+    update_cache: true
+  when: cve_kernel_is_deb_family | bool
+
+- name: Apply DirtyFrag mitigation file when needed
+  ansible.builtin.copy:
+    dest: /etc/modprobe.d/disable-dirtyfrag.conf
+    content: |
+      install esp4 /bin/false
+      install esp6 /bin/false
+      install rxrpc /bin/false
+    owner: root
+    group: root
+    mode: "0644"
+  when: cve_kernel_status_dirtyfrag_pre == 'VULNERABLE' or cve_kernel_status_fragnesia_pre == 'VULNERABLE'
+
+- name: Persist ptrace mitigation when needed
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-ssh-keysign-pwn.conf
+    content: |
+      kernel.yama.ptrace_scope = 2
+    owner: root
+    group: root
+    mode: "0644"
+  when: cve_kernel_status_sshkeysign_pre == 'VULNERABLE'
+
+- name: Apply ptrace runtime mitigation when needed
+  ansible.builtin.command: sysctl -w kernel.yama.ptrace_scope=2
+  changed_when: true
+  when: cve_kernel_status_sshkeysign_pre == 'VULNERABLE'
+
+- name: Persist CloudLinux user_ptrace mitigation
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-ptracenull.conf
+    content: |
+      kernel.user_ptrace = 0
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - cve_kernel_status_sshkeysign_pre == 'VULNERABLE'
+    - cve_kernel_distro_id == 'cloudlinux'
+
+- name: Apply CloudLinux user_ptrace runtime mitigation
+  ansible.builtin.command: sysctl -w kernel.user_ptrace=0
+  changed_when: true
+  failed_when: false
+  when:
+    - cve_kernel_status_sshkeysign_pre == 'VULNERABLE'
+    - cve_kernel_distro_id == 'cloudlinux'
+
+- name: Remove SUID bit on exploit-adjacent binaries
+  ansible.builtin.file:
+    path: "{{ item }}"
+    mode: "u-s"
+  loop:
+    - /usr/libexec/openssh/ssh-keysign
+    - /usr/lib/openssh/ssh-keysign
+    - /usr/bin/chage
+  failed_when: false
+  when: cve_kernel_status_sshkeysign_pre == 'VULNERABLE'
+
+- name: Upgrade nginx when installed
+  ansible.builtin.package:
+    name: nginx
+    state: latest
+  when: cve_kernel_nginx_present | bool
+
+- name: Include kernel detection
+  ansible.builtin.include_tasks: common/kernel_detect.yml
+
+- name: Set prepare reboot reason
+  ansible.builtin.set_fact:
+    cve_kernel_reboot_reason: "prepare mode does not reboot"
+
+- name: Include post-action mitigation signals
+  ansible.builtin.include_tasks: common/signals_post.yml
+
+- name: Include post-action status computation
+  ansible.builtin.include_tasks: common/status_post.yml

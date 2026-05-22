@@ -1,0 +1,114 @@
+---
+- name: Include common initialization
+  ansible.builtin.include_tasks: common/init.yml
+
+- name: Include pre-action mitigation signals
+  ansible.builtin.include_tasks: common/signals_pre.yml
+
+- name: Include pre-action status computation
+  ansible.builtin.include_tasks: common/status_pre.yml
+
+- name: Include kernel detection
+  ansible.builtin.include_tasks: common/kernel_detect.yml
+
+- name: Initialize boot validation flags
+  ansible.builtin.set_fact:
+    cve_kernel_boot_validated: false
+    cve_kernel_boot_validation_reason: "boot validation was not executed"
+
+- name: Validate boot target on RHEL family
+  when: cve_kernel_is_rhel_family | bool
+  block:
+    - name: Read current default kernel from grubby
+      ansible.builtin.command: grubby --default-kernel
+      register: cve_kernel_rhel_default_kernel_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Normalize RHEL default kernel value
+      ansible.builtin.set_fact:
+        cve_kernel_rhel_default_kernel: "{{ cve_kernel_rhel_default_kernel_raw.stdout | default('') | trim | regex_replace('^.*/vmlinuz-', '') }}"
+
+    - name: Set RHEL boot validation result
+      ansible.builtin.set_fact:
+        cve_kernel_boot_validated: >-
+          {{
+            cve_kernel_rhel_default_kernel_raw.rc == 0 and
+            cve_kernel_rhel_default_kernel == cve_kernel_newest_installed_kernel
+          }}
+        cve_kernel_boot_validation_reason: >-
+          {{
+            'grubby missing or failed to return default kernel' if cve_kernel_rhel_default_kernel_raw.rc != 0
+            else ('default boot kernel matches newest installed kernel' if cve_kernel_rhel_default_kernel == cve_kernel_newest_installed_kernel
+            else 'default boot kernel does not match newest installed kernel')
+          }}
+
+- name: Validate boot target on Debian family
+  when: cve_kernel_is_deb_family | bool
+  block:
+    - name: Check if newest installed kernel image exists in /boot
+      ansible.builtin.stat:
+        path: "/boot/vmlinuz-{{ cve_kernel_newest_installed_kernel }}"
+      register: cve_kernel_deb_boot_image
+
+    - name: Set Debian boot validation result
+      ansible.builtin.set_fact:
+        cve_kernel_boot_validated: "{{ cve_kernel_deb_boot_image.stat.exists | default(false) }}"
+        cve_kernel_boot_validation_reason: >-
+          {{
+            'newest kernel image is present in /boot' if cve_kernel_deb_boot_image.stat.exists | default(false)
+            else 'newest kernel image missing in /boot'
+          }}
+
+- name: Set reboot gates
+  ansible.builtin.set_fact:
+    cve_kernel_reboot_needed: >-
+      {{
+        (cve_kernel_newest_installed_kernel_norm is version(cve_kernel_running_kernel_norm, '>')) and
+        (cve_kernel_boot_validated or not cve_kernel_require_boot_validation)
+      }}
+    cve_kernel_reboot_reason: >-
+      {{
+        'newer kernel installed and boot target validated'
+        if (cve_kernel_newest_installed_kernel_norm is version(cve_kernel_running_kernel_norm, '>'))
+        and (cve_kernel_boot_validated or not cve_kernel_require_boot_validation)
+        else (
+          'newer kernel installed but boot validation failed: '
+          + cve_kernel_boot_validation_reason
+          if (cve_kernel_newest_installed_kernel_norm is version(cve_kernel_running_kernel_norm, '>'))
+          else 'already running newest detected kernel'
+        )
+      }}
+
+- name: Reboot decision debug
+  ansible.builtin.debug:
+    msg:
+      - "Running kernel raw: {{ cve_kernel_running_kernel }}"
+      - "Running kernel normalized: {{ cve_kernel_running_kernel_norm }}"
+      - "Newest installed raw: {{ cve_kernel_newest_installed_kernel }}"
+      - "Newest installed normalized: {{ cve_kernel_newest_installed_kernel_norm }}"
+      - "Boot validated: {{ cve_kernel_boot_validated }}"
+      - "Boot validation reason: {{ cve_kernel_boot_validation_reason }}"
+      - "Reboot needed: {{ cve_kernel_reboot_needed }}"
+      - "Reboot reason: {{ cve_kernel_reboot_reason }}"
+
+- name: Reboot host when needed
+  ansible.builtin.reboot:
+    reboot_timeout: "{{ cve_kernel_reboot_timeout_seconds }}"
+    connect_timeout: 30
+    post_reboot_delay: 20
+  when: cve_kernel_reboot_needed | bool
+
+- name: Refresh facts after reboot
+  ansible.builtin.setup:
+  when: cve_kernel_reboot_needed | bool
+
+- name: Refresh running kernel after reboot
+  ansible.builtin.set_fact:
+    cve_kernel_running_kernel: "{{ ansible_kernel }}"
+
+- name: Include post-action mitigation signals
+  ansible.builtin.include_tasks: common/signals_post.yml
+
+- name: Include post-action status computation
+  ansible.builtin.include_tasks: common/status_post.yml

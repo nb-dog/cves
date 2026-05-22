@@ -1,0 +1,38 @@
+---
+- name: Ensure reports directory exists
+  ansible.builtin.file:
+    path: "{{ cve_kernel_reports_dir }}"
+    state: directory
+    mode: "0755"
+  run_once: true
+  delegate_to: localhost
+  become: false
+
+- name: Render CSV audit report
+  ansible.builtin.template:
+    src: cve_report.csv.j2
+    dest: "{{ cve_kernel_reports_dir }}/cveoverview_{{ lookup('pipe', 'date +%d%m%Y') }}.csv"
+    mode: "0644"
+  vars:
+    cve_kernel_all_reports: "{{ ansible_play_hosts | map('extract', hostvars, 'cve_kernel_host_report') | list }}"
+  run_once: true
+  delegate_to: localhost
+  become: false
+
+- name: Render unfixed hosts inventory
+  ansible.builtin.template:
+    src: unfixedhosts.yml.j2
+    dest: "{{ cve_kernel_reports_dir }}/unfixedhosts.yml"
+    mode: "0644"
+  vars:
+    cve_kernel_unfixed_reports: >-
+      {{ ansible_play_hosts
+         | map('extract', hostvars)
+         | selectattr('cve_kernel_fully_fixed', 'defined')
+         | rejectattr('cve_kernel_fully_fixed', 'equalto', true)
+         | map(attribute='cve_kernel_host_report')
+         | list }}
+    cve_kernel_unreachable_hosts: "{{ ansible_play_hosts_all | difference(ansible_play_hosts) | list }}"
+  run_once: true
+  delegate_to: localhost
+  become: false
