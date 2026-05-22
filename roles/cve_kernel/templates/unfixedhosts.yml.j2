@@ -1,0 +1,14 @@
+---
+all:
+  hosts:
+{% for host in cve_kernel_unfixed_reports %}
+    {{ host.hostname }}:
+      audit_copyfail: "{{ host.copyfail }}"
+      audit_dirtyfrag: "{{ host.dirtyfrag }}"
+      audit_fragnesia: "{{ host.fragnesia }}"
+      audit_sshkeysign: "{{ host.sshkeysign }}"
+{% endfor %}
+{% for host in cve_kernel_unreachable_hosts %}
+    {{ host }}:
+      audit_note: "unreachable"
+{% endfor %}

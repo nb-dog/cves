@@ -1,0 +1,464 @@
+---
+- name: Classify platform
+  ansible.builtin.set_fact:
+    cve_kernel_distro_id: "{{ ansible_distribution | lower }}"
+    cve_kernel_distro_major: "{{ ansible_distribution_major_version | string }}"
+    cve_kernel_running_kernel: "{{ ansible_kernel }}"
+    cve_kernel_is_rhel_family: "{{ (ansible_distribution | lower) in cve_kernel_rhel_family_distros }}"
+    cve_kernel_is_deb_family: "{{ (ansible_distribution | lower) in cve_kernel_deb_family_distros }}"
+
+- name: Assert supported platform
+  ansible.builtin.assert:
+    that:
+      - cve_kernel_is_rhel_family | bool or cve_kernel_is_deb_family | bool
+    fail_msg: "Unsupported platform: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+- name: Resolve fixed kernel thresholds
+  ansible.builtin.set_fact:
+    cve_kernel_dirtyfrag_fixed_ver: "{{ cve_kernel_dirtyfrag_fixed_versions.get(cve_kernel_distro_major, 'unknown') }}"
+    cve_kernel_fragnesia_fixed_ver: "{{ cve_kernel_fragnesia_fixed_versions.get(cve_kernel_distro_major, 'unknown') }}"
+    cve_kernel_sshkeysign_fixed_ver: "{{ cve_kernel_sshkeysign_fixed_versions.get(cve_kernel_distro_major, 'unknown') }}"
+
+- name: Gather package facts
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Capture mitigation signals
+  block:
+    - name: Check DirtyFrag modprobe mitigation file
+      ansible.builtin.stat:
+        path: /etc/modprobe.d/disable-dirtyfrag.conf
+      register: cve_kernel_modprobe_file
+
+    - name: Read ptrace sysctl
+      ansible.builtin.command: sysctl -n kernel.yama.ptrace_scope
+      register: cve_kernel_ptrace_scope_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Read CloudLinux user_ptrace sysctl
+      ansible.builtin.command: sysctl -n kernel.user_ptrace
+      register: cve_kernel_user_ptrace_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Read user namespace sysctl
+      ansible.builtin.command: sysctl -n user.max_user_namespaces
+      register: cve_kernel_userns_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Normalize mitigation signal values
+      ansible.builtin.set_fact:
+        cve_kernel_ptrace_scope: "{{ cve_kernel_ptrace_scope_raw.stdout | default('0') | trim }}"
+        cve_kernel_user_ptrace: "{{ cve_kernel_user_ptrace_raw.stdout | default('N/A') | trim }}"
+        cve_kernel_userns: "{{ cve_kernel_userns_raw.stdout | default('65536') | trim }}"
+        cve_kernel_modprobe_present: "{{ cve_kernel_modprobe_file.stat.exists | default(false) }}"
+
+- name: Detect nginx package presence
+  ansible.builtin.set_fact:
+    cve_kernel_nginx_present: "{{ 'nginx' in ansible_facts.packages }}"
+
+- name: Compute pre-action CVE statuses
+  ansible.builtin.set_fact:
+    cve_kernel_status_dirtyfrag_pre: >-
+      {{
+        'FIXED' if cve_kernel_dirtyfrag_fixed_ver != 'unknown' and (cve_kernel_running_kernel is version(cve_kernel_dirtyfrag_fixed_ver, '>='))
+        else ('MITIGATED' if cve_kernel_modprobe_present or cve_kernel_userns == '0' else 'VULNERABLE')
+      }}
+    cve_kernel_status_fragnesia_pre: >-
+      {{
+        'FIXED' if cve_kernel_fragnesia_fixed_ver != 'unknown' and (cve_kernel_running_kernel is version(cve_kernel_fragnesia_fixed_ver, '>='))
+        else ('MITIGATED' if cve_kernel_modprobe_present or cve_kernel_userns == '0' else 'VULNERABLE')
+      }}
+    cve_kernel_status_sshkeysign_pre: >-
+      {{
+        'FIXED' if cve_kernel_sshkeysign_fixed_ver != 'unknown' and (cve_kernel_running_kernel is version(cve_kernel_sshkeysign_fixed_ver, '>='))
+        else ('MITIGATED' if (cve_kernel_ptrace_scope | int >= 2) or cve_kernel_user_ptrace == '0' else 'VULNERABLE')
+      }}
+
+- name: Run prepare mode
+  when: cve_kernel_action_mode == 'prepare'
+  block:
+    - name: Update RHEL kernel packages
+      ansible.builtin.dnf:
+        name:
+          - kernel
+          - kernel-core
+          - kernel-modules
+        state: latest
+        update_cache: true
+      when: cve_kernel_is_rhel_family | bool
+
+    - name: Set Debian kernel meta package
+      ansible.builtin.set_fact:
+        cve_kernel_deb_kernel_meta: "{{ cve_kernel_debian_kernel_meta.get(ansible_architecture, 'linux-image-amd64') }}"
+      when: cve_kernel_is_deb_family | bool
+
+    - name: Update Debian kernel meta package
+      ansible.builtin.apt:
+        name: "{{ 'linux-image-generic' if cve_kernel_distro_id == 'ubuntu' else cve_kernel_deb_kernel_meta }}"
+        state: latest
+        update_cache: true
+      when: cve_kernel_is_deb_family | bool
+
+    - name: Apply DirtyFrag mitigation file when needed
+      ansible.builtin.copy:
+        dest: /etc/modprobe.d/disable-dirtyfrag.conf
+        content: |
+          install esp4 /bin/false
+          install esp6 /bin/false
+          install rxrpc /bin/false
+        owner: root
+        group: root
+        mode: "0644"
+      when:
+        - cve_kernel_status_dirtyfrag_pre == 'VULNERABLE' or cve_kernel_status_fragnesia_pre == 'VULNERABLE'
+
+    - name: Persist ptrace mitigation when needed
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-ssh-keysign-pwn.conf
+        content: |
+          kernel.yama.ptrace_scope = 2
+        owner: root
+        group: root
+        mode: "0644"
+      when: cve_kernel_status_sshkeysign_pre == 'VULNERABLE'
+
+    - name: Apply ptrace runtime mitigation when needed
+      ansible.builtin.command: sysctl -w kernel.yama.ptrace_scope=2
+      changed_when: true
+      when: cve_kernel_status_sshkeysign_pre == 'VULNERABLE'
+
+    - name: Persist CloudLinux user_ptrace mitigation
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-ptracenull.conf
+        content: |
+          kernel.user_ptrace = 0
+        owner: root
+        group: root
+        mode: "0644"
+      when:
+        - cve_kernel_status_sshkeysign_pre == 'VULNERABLE'
+        - cve_kernel_distro_id == 'cloudlinux'
+
+    - name: Apply CloudLinux user_ptrace runtime mitigation
+      ansible.builtin.command: sysctl -w kernel.user_ptrace=0
+      changed_when: true
+      failed_when: false
+      when:
+        - cve_kernel_status_sshkeysign_pre == 'VULNERABLE'
+        - cve_kernel_distro_id == 'cloudlinux'
+
+    - name: Remove SUID bit on exploit-adjacent binaries
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: "u-s"
+      loop:
+        - /usr/libexec/openssh/ssh-keysign
+        - /usr/lib/openssh/ssh-keysign
+        - /usr/bin/chage
+      failed_when: false
+      when: cve_kernel_status_sshkeysign_pre == 'VULNERABLE'
+
+    - name: Upgrade nginx when installed
+      ansible.builtin.package:
+        name: nginx
+        state: latest
+      when: cve_kernel_nginx_present | bool
+
+- name: Run ssh-keysign mitigation mode
+  when: cve_kernel_action_mode == 'mitigate_sshkeysign'
+  block:
+    - name: Persist ptrace scope mitigation
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-ssh-keysign-pwn.conf
+        content: |
+          kernel.yama.ptrace_scope = 2
+        owner: root
+        group: root
+        mode: "0644"
+      when: cve_kernel_status_sshkeysign_pre == 'VULNERABLE'
+
+    - name: Apply ptrace scope runtime mitigation
+      ansible.builtin.command: sysctl -w kernel.yama.ptrace_scope=2
+      changed_when: true
+      when: cve_kernel_status_sshkeysign_pre == 'VULNERABLE'
+
+    - name: Persist CloudLinux user_ptrace mitigation
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-ptracenull.conf
+        content: |
+          kernel.user_ptrace = 0
+        owner: root
+        group: root
+        mode: "0644"
+      when:
+        - cve_kernel_status_sshkeysign_pre == 'VULNERABLE'
+        - cve_kernel_distro_id == 'cloudlinux'
+
+    - name: Apply CloudLinux user_ptrace runtime mitigation
+      ansible.builtin.command: sysctl -w kernel.user_ptrace=0
+      changed_when: true
+      failed_when: false
+      when:
+        - cve_kernel_status_sshkeysign_pre == 'VULNERABLE'
+        - cve_kernel_distro_id == 'cloudlinux'
+
+- name: Refresh package facts after mutation modes
+  ansible.builtin.package_facts:
+    manager: auto
+  when: cve_kernel_action_mode in ['prepare', 'reboot', 'mitigate_sshkeysign']
+
+- name: Determine newest installed kernel on RHEL family
+  ansible.builtin.shell: |
+    set -o pipefail
+    (
+      rpm -q kernel-core --queryformat '%{EVR}.%{ARCH}\n' 2>/dev/null || true
+      rpm -q kernel --queryformat '%{EVR}.%{ARCH}\n' 2>/dev/null || true
+    ) | grep -E '^[0-9]' | sed 's/^[0-9]*://' | sort -V | tail -1
+  args:
+    executable: /bin/bash
+  register: cve_kernel_rhel_newest_installed_raw
+  changed_when: false
+  when: cve_kernel_is_rhel_family | bool
+
+- name: Determine newest installed kernel on Debian family
+  ansible.builtin.shell: |
+    set -o pipefail
+    dpkg --list 'linux-image-[0-9]*' 'pve-kernel-[0-9]*' 'proxmox-kernel-[0-9]*' 2>/dev/null \
+      | awk '/^ii/{print $2}' \
+      | sed 's/linux-image-//; s/pve-kernel-//; s/proxmox-kernel-//' \
+      | sort -V | tail -1
+  args:
+    executable: /bin/bash
+  register: cve_kernel_deb_newest_installed_raw
+  changed_when: false
+  when: cve_kernel_is_deb_family | bool
+
+- name: Set newest installed kernel from family-specific detection
+  ansible.builtin.set_fact:
+    cve_kernel_newest_installed_kernel_raw: >-
+      {{ cve_kernel_rhel_newest_installed_raw.stdout if cve_kernel_is_rhel_family | bool else cve_kernel_deb_newest_installed_raw.stdout }}
+
+- name: Normalize newest installed kernel value
+  ansible.builtin.set_fact:
+    cve_kernel_newest_installed_kernel: "{{ cve_kernel_newest_installed_kernel_raw | default(cve_kernel_running_kernel, true) | trim }}"
+
+- name: Normalize running and installed kernel values
+  ansible.builtin.set_fact:
+    cve_kernel_running_kernel_norm: "{{ cve_kernel_running_kernel | regex_replace('\\.(x86_64|aarch64|i686|amd64|arm64)$', '') }}"
+    cve_kernel_newest_installed_kernel_norm: "{{ cve_kernel_newest_installed_kernel | regex_replace('\\.(x86_64|aarch64|i686|amd64|arm64)$', '') }}"
+
+- name: Run reboot mode
+  when: cve_kernel_action_mode == 'reboot'
+  block:
+    - name: Initialize boot validation flags
+      ansible.builtin.set_fact:
+        cve_kernel_boot_validated: false
+        cve_kernel_boot_validation_reason: "boot validation was not executed"
+
+    - name: Validate boot target on RHEL family
+      when: cve_kernel_is_rhel_family | bool
+      block:
+        - name: Read current default kernel from grubby
+          ansible.builtin.command: grubby --default-kernel
+          register: cve_kernel_rhel_default_kernel_raw
+          changed_when: false
+          failed_when: false
+
+        - name: Normalize RHEL default kernel value
+          ansible.builtin.set_fact:
+            cve_kernel_rhel_default_kernel: "{{ cve_kernel_rhel_default_kernel_raw.stdout | default('') | trim | regex_replace('^.*/vmlinuz-', '') }}"
+
+        - name: Set RHEL boot validation result
+          ansible.builtin.set_fact:
+            cve_kernel_boot_validated: >-
+              {{
+                cve_kernel_rhel_default_kernel_raw.rc == 0 and
+                cve_kernel_rhel_default_kernel == cve_kernel_newest_installed_kernel
+              }}
+            cve_kernel_boot_validation_reason: >-
+              {{
+                'grubby missing or failed to return default kernel' if cve_kernel_rhel_default_kernel_raw.rc != 0
+                else ('default boot kernel matches newest installed kernel' if cve_kernel_rhel_default_kernel == cve_kernel_newest_installed_kernel
+                else 'default boot kernel does not match newest installed kernel')
+              }}
+
+    - name: Validate boot target on Debian family
+      when: cve_kernel_is_deb_family | bool
+      block:
+        - name: Check if newest installed kernel image exists in /boot
+          ansible.builtin.stat:
+            path: "/boot/vmlinuz-{{ cve_kernel_newest_installed_kernel }}"
+          register: cve_kernel_deb_boot_image
+
+        - name: Set Debian boot validation result
+          ansible.builtin.set_fact:
+            cve_kernel_boot_validated: "{{ cve_kernel_deb_boot_image.stat.exists | default(false) }}"
+            cve_kernel_boot_validation_reason: >-
+              {{
+                'newest kernel image is present in /boot' if cve_kernel_deb_boot_image.stat.exists | default(false)
+                else 'newest kernel image missing in /boot'
+              }}
+
+    - name: Set reboot gates
+      ansible.builtin.set_fact:
+        cve_kernel_reboot_needed: >-
+          {{
+            (cve_kernel_newest_installed_kernel_norm is version(cve_kernel_running_kernel_norm, '>')) and
+            (cve_kernel_boot_validated or not cve_kernel_require_boot_validation)
+          }}
+        cve_kernel_reboot_reason: >-
+          {{
+            'newer kernel installed and boot target validated'
+            if (cve_kernel_newest_installed_kernel_norm is version(cve_kernel_running_kernel_norm, '>'))
+            and (cve_kernel_boot_validated or not cve_kernel_require_boot_validation)
+            else (
+              'newer kernel installed but boot validation failed: '
+              + cve_kernel_boot_validation_reason
+              if (cve_kernel_newest_installed_kernel_norm is version(cve_kernel_running_kernel_norm, '>'))
+              else 'already running newest detected kernel'
+            )
+          }}
+
+    - name: Reboot decision debug
+      ansible.builtin.debug:
+        msg:
+          - "Running kernel raw: {{ cve_kernel_running_kernel }}"
+          - "Running kernel normalized: {{ cve_kernel_running_kernel_norm }}"
+          - "Newest installed raw: {{ cve_kernel_newest_installed_kernel }}"
+          - "Newest installed normalized: {{ cve_kernel_newest_installed_kernel_norm }}"
+          - "Boot validated: {{ cve_kernel_boot_validated }}"
+          - "Boot validation reason: {{ cve_kernel_boot_validation_reason }}"
+          - "Reboot needed: {{ cve_kernel_reboot_needed }}"
+          - "Reboot reason: {{ cve_kernel_reboot_reason }}"
+
+    - name: Reboot host when needed
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ cve_kernel_reboot_timeout_seconds }}"
+        connect_timeout: 30
+        post_reboot_delay: 20
+      when: cve_kernel_reboot_needed | bool
+
+    - name: Refresh facts after reboot
+      ansible.builtin.setup:
+      when: cve_kernel_reboot_needed | bool
+
+    - name: Refresh running kernel after reboot
+      ansible.builtin.set_fact:
+        cve_kernel_running_kernel: "{{ ansible_kernel }}"
+
+- name: Re-capture mitigation signals post action
+  block:
+    - name: Check DirtyFrag modprobe mitigation file (post)
+      ansible.builtin.stat:
+        path: /etc/modprobe.d/disable-dirtyfrag.conf
+      register: cve_kernel_modprobe_file_post
+
+    - name: Read ptrace sysctl (post)
+      ansible.builtin.command: sysctl -n kernel.yama.ptrace_scope
+      register: cve_kernel_ptrace_scope_raw_post
+      changed_when: false
+      failed_when: false
+
+    - name: Read CloudLinux user_ptrace sysctl (post)
+      ansible.builtin.command: sysctl -n kernel.user_ptrace
+      register: cve_kernel_user_ptrace_raw_post
+      changed_when: false
+      failed_when: false
+
+    - name: Read user namespace sysctl (post)
+      ansible.builtin.command: sysctl -n user.max_user_namespaces
+      register: cve_kernel_userns_raw_post
+      changed_when: false
+      failed_when: false
+
+    - name: Normalize mitigation signal values (post)
+      ansible.builtin.set_fact:
+        cve_kernel_ptrace_scope_post: "{{ cve_kernel_ptrace_scope_raw_post.stdout | default('0') | trim }}"
+        cve_kernel_user_ptrace_post: "{{ cve_kernel_user_ptrace_raw_post.stdout | default('N/A') | trim }}"
+        cve_kernel_userns_post: "{{ cve_kernel_userns_raw_post.stdout | default('65536') | trim }}"
+        cve_kernel_modprobe_present_post: "{{ cve_kernel_modprobe_file_post.stat.exists | default(false) }}"
+
+- name: Compute post-action CVE statuses
+  ansible.builtin.set_fact:
+    cve_kernel_status_dirtyfrag_post: >-
+      {{
+        'FIXED' if cve_kernel_dirtyfrag_fixed_ver != 'unknown' and (cve_kernel_running_kernel is version(cve_kernel_dirtyfrag_fixed_ver, '>='))
+        else ('MITIGATED' if cve_kernel_modprobe_present_post or cve_kernel_userns_post == '0' else 'VULNERABLE')
+      }}
+    cve_kernel_status_fragnesia_post: >-
+      {{
+        'FIXED' if cve_kernel_fragnesia_fixed_ver != 'unknown' and (cve_kernel_running_kernel is version(cve_kernel_fragnesia_fixed_ver, '>='))
+        else ('MITIGATED' if cve_kernel_modprobe_present_post or cve_kernel_userns_post == '0' else 'VULNERABLE')
+      }}
+    cve_kernel_status_sshkeysign_post: >-
+      {{
+        'FIXED' if cve_kernel_sshkeysign_fixed_ver != 'unknown' and (cve_kernel_running_kernel is version(cve_kernel_sshkeysign_fixed_ver, '>='))
+        else ('MITIGATED' if (cve_kernel_ptrace_scope_post | int >= 2) or cve_kernel_user_ptrace_post == '0' else 'VULNERABLE')
+      }}
+
+- name: Build host report
+  ansible.builtin.set_fact:
+    cve_kernel_fully_fixed: >-
+      {{
+        cve_kernel_status_dirtyfrag_post == 'FIXED' and
+        cve_kernel_status_fragnesia_post == 'FIXED' and
+        cve_kernel_status_sshkeysign_post == 'FIXED'
+      }}
+    cve_kernel_host_report:
+      hostname: "{{ inventory_hostname }}"
+      os: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+      running_kernel: "{{ cve_kernel_running_kernel }}"
+      installed_kernel: "{{ cve_kernel_newest_installed_kernel }}"
+      reboot_needed: "{{ cve_kernel_running_kernel != cve_kernel_newest_installed_kernel }}"
+      dirtyfrag: "{{ cve_kernel_status_dirtyfrag_post }}"
+      fragnesia: "{{ cve_kernel_status_fragnesia_post }}"
+      copyfail: "{{ cve_kernel_status_dirtyfrag_post }}"
+      sshkeysign: "{{ cve_kernel_status_sshkeysign_post }}"
+      nginx: "{{ 'CHECK_MANUALLY' if cve_kernel_nginx_present | bool else 'N/A' }}"
+      ptrace_scope: "{{ cve_kernel_ptrace_scope_post }}"
+      user_ptrace: "{{ cve_kernel_user_ptrace_post }}"
+      modprobe: "{{ 'yes' if cve_kernel_modprobe_present_post else 'no' }}"
+      reboot_reason: "{{ cve_kernel_reboot_reason | default('n/a') }}"
+
+- name: Ensure reports directory exists
+  ansible.builtin.file:
+    path: "{{ cve_kernel_reports_dir }}"
+    state: directory
+    mode: "0755"
+  run_once: true
+  delegate_to: localhost
+  become: false
+
+- name: Render CSV audit report
+  ansible.builtin.template:
+    src: cve_report.csv.j2
+    dest: "{{ cve_kernel_reports_dir }}/cveoverview_{{ lookup('pipe', 'date +%d%m%Y') }}.csv"
+    mode: "0644"
+  vars:
+    cve_kernel_all_reports: "{{ ansible_play_hosts | map('extract', hostvars, 'cve_kernel_host_report') | list }}"
+  run_once: true
+  delegate_to: localhost
+  become: false
+  when: cve_kernel_action_mode == 'audit'
+
+- name: Render unfixed hosts inventory
+  ansible.builtin.template:
+    src: unfixedhosts.yml.j2
+    dest: "{{ cve_kernel_reports_dir }}/unfixedhosts.yml"
+    mode: "0644"
+  vars:
+    cve_kernel_unfixed_reports: >-
+      {{ ansible_play_hosts
+         | map('extract', hostvars)
+         | selectattr('cve_kernel_fully_fixed', 'defined')
+         | rejectattr('cve_kernel_fully_fixed', 'equalto', true)
+         | map(attribute='cve_kernel_host_report')
+         | list }}
+    cve_kernel_unreachable_hosts: "{{ ansible_play_hosts_all | difference(ansible_play_hosts) | list }}"
+  run_once: true
+  delegate_to: localhost
+  become: false
+  when: cve_kernel_action_mode == 'audit'

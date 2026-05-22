@@ -1,0 +1,4 @@
+hostname,os,running_kernel,installed_kernel,reboot_needed,CopyFail,DirtyFrag,Fragnesia,ssh-keysign-pwn,NGINX
+{% for item in cve_kernel_all_reports %}
+{{ item.hostname }},{{ item.os | replace(',', '') }},{{ item.running_kernel }},{{ item.installed_kernel }},{{ item.reboot_needed }},{{ item.copyfail }},{{ item.dirtyfrag }},{{ item.fragnesia }},{{ item.sshkeysign }},{{ item.nginx }}
+{% endfor %}

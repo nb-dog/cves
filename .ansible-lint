@@ -1,0 +1,8 @@
+profile: basic
+exclude_paths:
+  - legacy/
+warn_list:
+  - run-once
+skip_list:
+  - package-latest
+  - var-naming
