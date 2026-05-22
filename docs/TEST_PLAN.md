@@ -18,10 +18,17 @@ ansible-playbook playbooks/reboot.yml -i inventory/hosts.yml --limit <host>
 ansible-playbook playbooks/mitigate_sshkeysign.yml -i inventory/hosts.yml --limit <host>
 ```
 
+If sudo password is required:
+
+```bash
+ansible-playbook playbooks/audit.yml -i inventory/hosts.yml --limit <host> -K
+```
+
 ## Assertions
 
 - `audit`: CSV and unfixed inventory are generated in `reports/`.
 - `prepare`: kernel packages are updated and mitigations applied when still vulnerable.
-- `reboot`: reboot only occurs when installed kernel differs from running kernel.
+- `reboot`: reboot only occurs when installed kernel is newer than running kernel and boot validation passes.
+- `reboot`: verify debug output includes running/installed raw+normalized values and boot validation reason.
 - `mitigate_sshkeysign`: ptrace mitigations are present and active.
 - rerun idempotence: second run should produce minimal changes.

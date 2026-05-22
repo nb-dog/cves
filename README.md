@@ -26,6 +26,12 @@ ansible-playbook playbooks/mitigate_sshkeysign.yml -i inventory/hosts.yml
 
 - `playbooks/`: entrypoint playbooks
 - `roles/cve_kernel/`: shared role with mode-driven logic
+- `roles/cve_kernel/tasks/main.yml`: stage dispatcher
+- `roles/cve_kernel/tasks/audit.yml`: audit stage tasks
+- `roles/cve_kernel/tasks/prepare.yml`: prepare stage tasks
+- `roles/cve_kernel/tasks/reboot.yml`: reboot stage tasks
+- `roles/cve_kernel/tasks/mitigate_sshkeysign.yml`: ssh-keysign mitigation stage tasks
+- `roles/cve_kernel/tasks/common/`: shared task building blocks
 - `inventory/hosts.yml`: inventory file
 - `docs/HOW_IT_WORKS.md`: complete architecture and operations guide
 - `docs/BEHAVIOR_MATRIX.md`: mode-by-mode behavior contract
@@ -44,4 +50,13 @@ ansible-playbook --syntax-check playbooks/prepare.yml
 ansible-playbook --syntax-check playbooks/reboot.yml
 ansible-playbook --syntax-check playbooks/mitigate_sshkeysign.yml
 ansible-lint playbooks roles
+```
+
+## Privilege Escalation
+
+- Default escalation is `sudo`.
+- If your sudo policy requires a password prompt, run with `-K`:
+
+```bash
+ansible-playbook playbooks/audit.yml -i inventory/hosts.yml -K
 ```

@@ -20,12 +20,18 @@ Status model used by all playbooks:
 
 - Installs latest kernel packages.
 - Applies mitigations when host is not yet fixed.
-- Recomputes post-action status and recommends reboot only when needed.
+- Recomputes post-action status.
+- Does not reboot.
 
 ### reboot
 
-- Re-checks installed vs running kernel.
-- Reboots only when a newer kernel is installed.
+- Re-detects newest installed kernel and compares against running kernel.
+- Reboots only when `installed > running` (version-aware compare).
+- Requires boot validation by default (`cve_kernel_require_boot_validation: true`).
+- Uses boot validation:
+  - RHEL: `grubby --default-kernel` must match newest installed.
+  - Debian/Ubuntu: `/boot/vmlinuz-<newest>` must exist.
+- Emits reboot decision debug context for troubleshooting.
 - Recomputes status after reboot.
 - Removes temporary mitigations only after host is confirmed fixed.
 

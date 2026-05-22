@@ -1,7 +1,7 @@
 # CVE Kernel Playbooks: How They Work
 
 This repository provides four Ansible entrypoint playbooks backed by a shared role.
-It is designed to audit, prepare, reboot, and mitigate Linux hosts impacted by:
+It targets audit and remediation workflows for:
 
 - CVE-2026-31431 (Copy Fail)
 - CVE-2026-43284 (Dirty Frag)
@@ -11,116 +11,97 @@ It is designed to audit, prepare, reboot, and mitigate Linux hosts impacted by:
 
 ## Repository Layout
 
-- `playbooks/audit.yml`: read-only audit run and report generation
-- `playbooks/prepare.yml`: install kernel updates and apply mitigations when needed
-- `playbooks/reboot.yml`: reboot when safe and required
-- `playbooks/mitigate_sshkeysign.yml`: ssh-keysign mitigation only
-- `roles/cve_kernel/defaults/main.yml`: tunables and version thresholds
-- `roles/cve_kernel/tasks/main.yml`: shared execution logic
+- `playbooks/audit.yml`: read-only audit and report generation
+- `playbooks/prepare.yml`: package updates and mitigations
+- `playbooks/reboot.yml`: gated reboot flow
+- `playbooks/mitigate_sshkeysign.yml`: CVE-2026-46333 mitigation only
+- `roles/cve_kernel/defaults/main.yml`: tunables and fixed-version thresholds
+- `roles/cve_kernel/tasks/main.yml`: dispatcher by `cve_kernel_action_mode`
+- `roles/cve_kernel/tasks/audit.yml`: audit stage
+- `roles/cve_kernel/tasks/prepare.yml`: prepare stage
+- `roles/cve_kernel/tasks/reboot.yml`: reboot stage
+- `roles/cve_kernel/tasks/mitigate_sshkeysign.yml`: mitigation stage
+- `roles/cve_kernel/tasks/common/*.yml`: shared logic (init/signals/status/kernel/report)
 - `roles/cve_kernel/templates/cve_report.csv.j2`: CSV report template
-- `roles/cve_kernel/templates/unfixedhosts.yml.j2`: inventory artifact template
-- `docs/BEHAVIOR_MATRIX.md`: expected behavior matrix
-- `docs/TEST_PLAN.md`: pre-prod validation checklist
+- `roles/cve_kernel/templates/unfixedhosts.yml.j2`: unfixed inventory template
 
 ## Execution Model
 
-All entrypoint playbooks call the same role and set `cve_kernel_action_mode`:
+All entrypoint playbooks call the same role and set `cve_kernel_action_mode`.
+The dispatcher in `roles/cve_kernel/tasks/main.yml` includes exactly one stage file.
 
-- `audit`
-- `prepare`
-- `reboot`
-- `mitigate_sshkeysign`
+Shared common includes are reused by the stage files:
 
-The role runs in these phases:
-
-1. Platform detection and support assertion
-2. Threshold resolution (fixed kernel versions)
-3. Pre-action signal collection and CVE status computation
-4. Mode-specific actions
-5. Post-action signal collection and status recomputation
-6. Host report assembly and optional report artifact generation
+- `common/init.yml`: platform classification, support check, fixed thresholds, package facts
+- `common/signals_pre.yml`: pre-action mitigation signals
+- `common/status_pre.yml`: pre-action status computation
+- `common/kernel_detect.yml`: family-specific newest installed kernel detection + normalization
+- `common/signals_post.yml`: post-action mitigation signals
+- `common/status_post.yml`: post-action status computation + host report
+- `common/report.yml`: CSV + unfixed/unreachable artifacts
 
 ## Status Semantics
 
 Per CVE, status is one of:
 
-- `FIXED`: running kernel is at or above fixed version threshold
-- `MITIGATED`: running kernel is below threshold, but mitigation controls are active
-- `VULNERABLE`: kernel not fixed and mitigation signals absent
-- `N/A`: only used where CVE checks do not apply (for example NGINX absent)
+- `FIXED`: running kernel is at or above fixed threshold
+- `MITIGATED`: kernel not fixed, but mitigation controls are active
+- `VULNERABLE`: neither fixed nor mitigated
+- `N/A`: check does not apply (for example NGINX absent)
 
-Mitigation signals used by the role:
+Mitigation signals used:
 
 - `/etc/modprobe.d/disable-dirtyfrag.conf` present
 - `kernel.yama.ptrace_scope >= 2`
 - `kernel.user_ptrace == 0` (CloudLinux)
-- `user.max_user_namespaces == 0` (additional hardening signal)
+- `user.max_user_namespaces == 0`
 
 ## Mode Details
 
-## 1) audit
+### audit
 
-Purpose: read-only assessment and artifact generation.
-
-Actions:
-
-- Detect OS family and currently running kernel
-- Compute CVE statuses from kernel + mitigation signals
-- Build host report records
-- Generate:
+- No host changes.
+- Computes statuses from running kernel and mitigation signals.
+- Generates:
   - `reports/cveoverview_DDMMYYYY.csv`
   - `reports/unfixedhosts.yml`
 
-No package install, reboot, or mitigation write is performed.
+### prepare
 
-## 2) prepare
-
-Purpose: pre-maintenance patch-and-mitigate phase.
-
-Actions:
-
-- Update kernel packages:
-  - RHEL family: `kernel`, `kernel-core`, `kernel-modules`
+- Updates kernel packages:
+  - RHEL: `kernel`, `kernel-core`, `kernel-modules`
   - Ubuntu: `linux-image-generic`
-  - Debian: architecture-aware meta package mapping (from defaults)
-- Apply Dirty Frag mitigation file when CVE state is vulnerable
-- Apply ssh-keysign mitigations when vulnerable:
-  - persist `kernel.yama.ptrace_scope = 2`
-  - runtime `sysctl -w kernel.yama.ptrace_scope=2`
-  - CloudLinux `kernel.user_ptrace = 0` persist + runtime
-- Remove SUID bit from exploit-adjacent binaries when vulnerable
-- Upgrade nginx package if installed
-- Recompute post-action states for accurate reporting
+  - Debian: mapped meta package from defaults
+- Applies mitigations where host is still vulnerable.
+- Recomputes post-action statuses.
+- Does not reboot.
 
-## 3) reboot
+### reboot
 
-Purpose: reboot safely after updates, only when justified.
+Reboot is gated and only happens when all required conditions are true:
 
-Reboot gating logic:
+1. Newest installed kernel is detected by family-specific logic (`rpm`/`dpkg`).
+2. Normalized version comparison confirms `installed > running`.
+3. Boot target validation passes (unless `cve_kernel_require_boot_validation: false`).
 
-- Determine `running_kernel` vs `newest_installed_kernel`
-- Validate boot target before reboot
-  - RHEL: use `grubby --default-kernel` and compare to newest installed
-  - Debian/Ubuntu: verify `/boot/vmlinuz-<newest>` exists
-- Reboot only if:
-  - running kernel differs from newest installed kernel, and
-  - boot validation passes (unless `cve_kernel_require_boot_validation: false`)
+Boot validation methods:
 
-Post reboot:
+- RHEL: `grubby --default-kernel` must match newest installed kernel
+- Debian/Ubuntu: `/boot/vmlinuz-<newest>` must exist
 
-- Refresh facts
-- Recompute CVE states and mitigation signals
-- Include reboot reason in host report
+Debug output prints the decision context:
 
-## 4) mitigate_sshkeysign
+- running kernel raw/normalized
+- newest installed kernel raw/normalized
+- boot validation result/reason
+- reboot needed/reason
 
-Purpose: apply only CVE-2026-46333 mitigation path.
+### mitigate_sshkeysign
 
-Actions:
-
-- Persist + runtime `kernel.yama.ptrace_scope=2`
-- CloudLinux: persist + runtime `kernel.user_ptrace=0`
-- Recompute post-action status
+- Applies only CVE-2026-46333 mitigation path.
+- Persists and applies runtime `kernel.yama.ptrace_scope=2`.
+- On CloudLinux also persists and applies runtime `kernel.user_ptrace=0`.
+- Recomputes post-action status.
 
 ## Defaults and Tunables
 
@@ -134,12 +115,9 @@ Key variables in `roles/cve_kernel/defaults/main.yml`:
 - `cve_kernel_reboot_timeout_seconds`
 - `cve_kernel_require_boot_validation`
 
-Override in inventory/group vars/host vars as needed.
+Override via inventory/group vars/host vars as needed.
 
 ## How To Use
-
-1. Populate `inventory/hosts.yml`.
-2. Run one of:
 
 ```bash
 ansible-playbook playbooks/audit.yml -i inventory/hosts.yml
@@ -148,35 +126,25 @@ ansible-playbook playbooks/reboot.yml -i inventory/hosts.yml
 ansible-playbook playbooks/mitigate_sshkeysign.yml -i inventory/hosts.yml
 ```
 
-3. Review artifacts in `reports/` after `audit`.
+If sudo password prompt is required:
 
-Recommended sequence for maintenance window workflows:
+```bash
+ansible-playbook playbooks/audit.yml -i inventory/hosts.yml -K
+```
+
+Recommended sequence:
 
 1. `audit`
 2. `prepare`
 3. `reboot`
-4. `audit` again (verification pass)
+4. `audit` (verification)
 
-## Safety Notes
-
-- `audit` is read-only.
-- `prepare` and `mitigate_sshkeysign` make system changes.
-- `reboot` can restart hosts; run during approved maintenance windows.
-- Boot validation is enabled by default (`cve_kernel_require_boot_validation: true`).
-
-## Validation Commands
-
-Syntax:
+## Validation
 
 ```bash
 ansible-playbook --syntax-check playbooks/audit.yml
 ansible-playbook --syntax-check playbooks/prepare.yml
 ansible-playbook --syntax-check playbooks/reboot.yml
 ansible-playbook --syntax-check playbooks/mitigate_sshkeysign.yml
-```
-
-Lint:
-
-```bash
 ansible-lint playbooks roles
 ```
